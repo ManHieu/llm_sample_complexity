@@ -1,0 +1,10 @@
+datasets
+evaluate
+peft
+scikit-learn
+transformers
+torch 
+torchvision 
+torchaudio
+trl
+
