@@ -7,4 +7,6 @@ torch
 torchvision 
 torchaudio
 trl
-
+bitsandbytes
+accelerate
+sentencepiece
