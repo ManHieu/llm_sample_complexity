@@ -13,27 +13,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+import random
+import shutil
 from typing import Dict, List, Optional
+import numpy as np
 import torch
 from accelerate import Accelerator
 from datasets import load_dataset
 from peft import AutoPeftModelForCausalLM, LoraConfig, get_peft_model
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, BitsAndBytesConfig, HfArgumentParser, TrainingArguments, AutoTokenizer
+from transformers import AutoModelForCausalLM, BitsAndBytesConfig, HfArgumentParser, TrainingArguments, AutoTokenizer, DisjunctiveConstraint
 from trl import is_xpu_available, DataCollatorForCompletionOnlyLM, SFTTrainer
 
 from arguments import ScriptArguments
 from data_module.preprocess import get_preprocessor
 from trainer import LLMComplexityTrainer
 
+torch.manual_seed(1741)
+random.seed(1741)
+np.random.seed(1741)
+
 
 tqdm.pandas()
 
-if __name__ == '__main__':
-    parser = HfArgumentParser(ScriptArguments)
-    script_args = parser.parse_args_into_dataclasses()[0]
-    output_dir = os.path.join(script_args.output_dir, script_args.dataset_name)
+def run(script_args):
+    output_dir = os.path.join(script_args.output_dir, f'{script_args.dataset_name}_{script_args.number_training_examples}')
 
     # Data processing
     tokenizer = AutoTokenizer.from_pretrained(script_args.model_name, 
@@ -46,7 +51,7 @@ if __name__ == '__main__':
                                     number_training_examples=script_args.number_training_examples)
     train_data, val_data, test_data = preprocessor.create_datasets(tokenizer=tokenizer, 
                                                                    script_args=script_args)
-    print(train_data)
+    print(len(train_data))
 
     # Load the model
     if script_args.load_in_8bit and script_args.load_in_4bit:
@@ -99,12 +104,11 @@ if __name__ == '__main__':
         generate_ids, label_ids = val_preds
         responses = tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
         labels = tokenizer.batch_decode(label_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-        metrics = preprocessor.compute_metric(preds=responses, labels=labels, number_training_example=script_args.number_training_examples)
+        metrics = preprocessor.compute_metric(preds=responses, 
+                                              labels=labels, 
+                                              number_training_example=script_args.number_training_examples,
+                                              save_wrong_preds=False)
         print(metrics)
-        with open('result.txt', 'a', encoding='utf-8') as f:
-            f.write(f'{script_args.dataset_name}: {script_args.number_training_examples} \n')
-            f.write(f'Metric: \n{metrics}\n')
-            f.write(f'_'*10 + '\n')
         return metrics
 
     # Define the training arguments
@@ -131,16 +135,21 @@ if __name__ == '__main__':
         gradient_checkpointing=script_args.gradient_checkpointing,
         load_best_model_at_end=True,
         evaluation_strategy='steps',
-        eval_steps=10,
+        eval_steps=script_args.save_steps,
         metric_for_best_model='acc',)
 
     # Define the Trainer
-    # instruct_template = "[INST] <<SYS>>"
-    # response_template = "\n[/INST]###Response: "
-    # collator = DataCollatorForCompletionOnlyLM(instruction_template=instruct_template, 
-    #                                            response_template=response_template, 
-    #                                            tokenizer=tokenizer, 
-    #                                            mlm=False)
+    instruct_template = "[INST] <<SYS>>"
+    response_template = "\n[/INST]###Response:"
+    collator = DataCollatorForCompletionOnlyLM(instruction_template=instruct_template, 
+                                               response_template=response_template, 
+                                               tokenizer=tokenizer, 
+                                               mlm=False)
+
+    if hasattr(preprocessor, 'posible_outputs'):
+        posible_outputs = preprocessor.posible_outputs
+        posible_outputs_ids = tokenizer(posible_outputs, add_special_tokens=False).input_ids
+        constraints = [DisjunctiveConstraint(posible_outputs_ids)]
     
     trainer = LLMComplexityTrainer(
         model=model,
@@ -149,11 +158,11 @@ if __name__ == '__main__':
         train_dataset=train_data,
         eval_dataset=val_data,
         dataset_text_field='input',
-        # data_collator=collator,
+        data_collator=collator,
         tokenizer=tokenizer,
         compute_metrics=compute_metrics,
+        generation_constraint=constraints
     )
-
     trainer.train()
 
     # Save the model
@@ -175,6 +184,54 @@ if __name__ == '__main__':
 
     output_merged_dir = os.path.join(training_args.output_dir, "final_merged_checkpoint")
     model.save_pretrained(output_merged_dir, safe_serialization=True)
+    shutil.rmtree(output_dir)
+
+    preprocessor = get_preprocessor(script_args.dataset_name, 
+                                    number_training_examples=script_args.number_training_examples)
+    _, _, test_data = preprocessor.load_dataset()
+    test_dataloader = DataLoader(test_data, batch_size=script_args.batch_size)
+    if hasattr(preprocessor, 'posible_outputs'):
+        posible_outputs = preprocessor.posible_outputs
+        posible_outputs_ids = tokenizer(posible_outputs, add_special_tokens=False).input_ids
+        constraints = [DisjunctiveConstraint(posible_outputs_ids)]
+
+    preds = []
+    labels = []
+    for batch in tqdm(test_dataloader):
+        prompt = batch['input']
+        gold = batch['gold']
+
+        gold_size = tokenizer(gold, return_tensors="pt", padding='longest').input_ids.size(-1)
+        inputs = tokenizer(prompt, return_tensors="pt", padding='longest')
+        generate_ids = model.generate(inputs.input_ids, 
+                                      attention_mask=inputs.attention_mask, 
+                                      max_length=gold_size,
+                                      num_beams=10,
+                                      do_sample=False,
+                                      num_return_sequences=1,
+                                      constraints=constraints,
+                                      no_repeat_ngram_size=2)
+        
+        responses = tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+        preds.extend(responses)
+        labels.extend(gold)
+    
+    metrics = preprocessor.compute_metric(preds=preds, labels=labels, number_training_example=script_args.number_training_examples)
+    print(metrics)
+    with open('result.txt', 'a', encoding='utf-8') as f:
+        f.write(f'{script_args.dataset_name}: {script_args.number_training_examples} \n')
+        f.write(f'Hprams: \n{script_args}\n')
+        f.write(f'Metric: \n{metrics}\n')
+        f.write(f'_'*10 + '\n')
+
+    return output_merged_dir
+
+
+if __name__ == '__main__':
+    parser = HfArgumentParser(ScriptArguments)
+    script_args = parser.parse_args_into_dataclasses()[0]
+
+    checkpoint_path = run(script_args=script_args)
 
 
 

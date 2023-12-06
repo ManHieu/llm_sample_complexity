@@ -149,14 +149,15 @@ class LLMComplexityTrainer(SFTTrainer):
         with torch.no_grad():
             loss = None
             with self.compute_loss_context_manager():
-                model.module.eval()
-                generate_ids = model.module.generate(input_ids=inputs['input_ids'], 
-                                                    attention_mask=inputs.attention_mask, 
-                                                    max_length=gold_size,
-                                                    num_beams=10,
-                                                    do_sample=False,
-                                                    num_return_sequences=1,
-                                                    constraints=self.generation_constraint,
-                                                    no_repeat_ngram_size=2) # not sure about it ....
+                if isinstance(model, nn.DataParallel):
+                    model = model.module
+                generate_ids = model.generate(input_ids=inputs['input_ids'], 
+                                            attention_mask=inputs.attention_mask, 
+                                            max_length=gold_size,
+                                            num_beams=10,
+                                            do_sample=False,
+                                            num_return_sequences=1,
+                                            constraints=self.generation_constraint,
+                                            no_repeat_ngram_size=2) 
 
         return (loss, generate_ids, labels)
