@@ -12,10 +12,11 @@ class ScriptArguments:
     dataset_name: Optional[str] = field(metadata={"help": "the dataset name"})
     seq_length: Optional[int] = field(default=512, metadata={"help": "Input sequence length"})
     number_training_examples: Optional[int] = field(default=50, metadata={'help': "Number examples of training data"})
+    colate_fn: Optional[str]=field(default='constant_len', metadata='Collate_fn for training data')
 
     # MODEL_PARAMS
     model_name: Optional[str] = field(default="meta-llama/Llama-2-7b-hf", metadata={"help": "the model name"})
-    load_in_8bit: Optional[bool] = field(default=False, metadata={"help": "load the model in 8 bits precision"})
+    # load_in_8bit: Optional[bool] = field(default=False, metadata={"help": "load the model in 8 bits precision"})
     load_in_4bit: Optional[bool] = field(default=False, metadata={"help": "load the model in 4 bits precision"})
     use_peft: Optional[bool] = field(default=True, metadata={"help": "Wether to use PEFT or not to train adapters"})
     trust_remote_code: Optional[bool] = field(default=False, metadata={"help": "Enable `trust_remote_code`"})

@@ -1,18 +1,42 @@
 from abc import ABC, abstractmethod
-from typing import Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
 from datasets import load_dataset, Dataset
 import torch
+from torch.utils.data import DataLoader
 import tqdm
-from trl.trainer import ConstantLengthDataset
+from trl.trainer import ConstantLengthDataset, DataCollatorForCompletionOnlyLM 
+from transformers import PreTrainedTokenizerBase
 
-from data_module.base_dataset import BaseDataset
+from .base_dataset import BaseDataset
 
 PREPROCESSOR = {}
 
 
+@dataclass
+class LLMComplexityDataCollator:
+    tokenizer: PreTrainedTokenizerBase
+    max_length: Optional[int] = None
+    return_tensors: str = "pt"
+
+    def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+        batch = self.tokenizer.pad(batch,
+                                padding='longest',
+                                max_length=self.max_length,
+                                return_tensors=self.return_tensors,)
+        if "label" in batch:
+            batch["labels"] = batch["label"]
+            del batch["label"]
+        if "label_ids" in batch:
+            batch["labels"] = batch["label_ids"]
+            del batch["label_ids"]
+        return batch
+
+
 class BasePreprocessor(ABC):
 
-    def __init__(self, number_training_examples: int) -> None:
+    def __init__(self, 
+                 number_training_examples: int,) -> None:
         super().__init__()
         self.number_training_examples = number_training_examples
 
@@ -32,24 +56,63 @@ class BasePreprocessor(ABC):
                        save_wrong_preds=True):
         raise NotImplementedError
     
-    def create_datasets(self, tokenizer, script_args):
+    def prepare_data(self, 
+                        tokenizer, 
+                        script_args):
         train_data, val_data, test_data = self.load_dataset()
-        chars_per_token = self.chars_token_ratio(train_data, tokenizer)
-        print(f"The character to token ratio of the dataset is: {chars_per_token:.2f}")
 
-        train_dataset = train_data
-        
+        if script_args.colate_fn == 'constant_len':
+            chars_per_token = self.chars_token_ratio(train_data, tokenizer)
+            print(f"The character to token ratio of the dataset is: {chars_per_token:.2f}")
+            train_dataset = ConstantLengthDataset(tokenizer,
+                                                train_data,
+                                                dataset_text_field='input',
+                                                seq_length=script_args.seq_length,
+                                                infinite=True,
+                                                chars_per_token=chars_per_token,
+                                                eos_token_id=tokenizer.eos_token_id,)
+        elif script_args.colate_fn == 'completion':
+            # instruct_template = "[INST] <<SYS>>"
+            response_template = "\n###Response:"
+            collator = DataCollatorForCompletionOnlyLM(response_template=response_template, 
+                                                    tokenizer=tokenizer, 
+                                                    mlm=False)
+            train_dataset = BaseDataset(train_data)
+            train_dataloader = DataLoader(train_dataset, 
+                                          batch_size=script_args.batch_size,
+                                          collate_fn=collator,
+                                          num_workers=8,
+                                          shuffle=True,
+                                          pin_memory=False,
+                                          drop_last=True)
+            
+        val_collator = LLMComplexityDataCollator(self.tokenizer, 
+                                                 self.max_seq_length)
         val_data = val_data.map(lambda example: self.tokenize_func_for_evaluation(examples=example, tokenizer=tokenizer, max_seq_len=script_args.seq_length),
                                 batched=True, remove_columns=val_data.column_names)
         val_data.set_format(type="torch", columns=val_data.column_names)
         val_dataset = BaseDataset(val_data)
+        val_dataloader = DataLoader(val_dataset,
+                                    batch_size=1,
+                                    collate_fn=val_collator,
+                                    num_workers=8,
+                                    shuffle=False,
+                                    pin_memory=False,
+                                    drop_last=True)
 
         test_data = test_data.map(lambda example: self.tokenize_func_for_evaluation(examples=example, tokenizer=tokenizer, max_seq_len=script_args.seq_length),
                                 batched=True, remove_columns=test_data.column_names)
         test_data.set_format(type="torch", columns=test_data.column_names)
         test_dataset = BaseDataset(test_data)
+        test_dataloader = DataLoader(test_dataset,
+                                    batch_size=1,
+                                    collate_fn=val_collator,
+                                    num_workers=8,
+                                    shuffle=False,
+                                    pin_memory=False,
+                                    drop_last=True)
 
-        return train_dataset, val_dataset, test_dataset
+        return train_dataloader, val_dataloader, test_dataloader
     
     @staticmethod
     def tokenize_func_for_evaluation(examples, tokenizer, max_seq_len):
@@ -110,7 +173,7 @@ class SSTPreprocessor(BasePreprocessor):
         for i in range(len(examples['text'])):
             input_text = examples['text'][i]
             response = self.label_mapping[examples['label'][i]]
-            text = f"[INST] <<SYS>> {self.instruction} <</SYS>> ###Text: {input_text} \n[/INST]###Response: {response}"
+            text = f"[INST] <<SYS>> {self.instruction} <</SYS>> ###Text: {input_text} \n[/INST]\n###Response: {response}"
             output_text.append(text)
         return {'input': output_text}
     
@@ -121,8 +184,8 @@ class SSTPreprocessor(BasePreprocessor):
         for i in range(len(examples['text'])):
             input_text = examples['text'][i]
             response = self.label_mapping[examples['label'][i]]
-            text = f"[INST] <<SYS>> {self.instruction} <</SYS>> ###Text: {input_text} \n[/INST]###Response:"
-            full_response = f"[INST] <<SYS>> {self.instruction} <</SYS>> ###Text: {input_text} \n[/INST]###Response: {response}"
+            text = f"[INST] <<SYS>> {self.instruction} <</SYS>> ###Text: {input_text} \n[/INST]\n###Response:"
+            full_response = f"[INST] <<SYS>> {self.instruction} <</SYS>> ###Text: {input_text} \n[/INST]\n###Response: {response}"
             output_text.append(text)
             gold_response.append(full_response)
             label.append(response)
@@ -146,8 +209,8 @@ class SSTPreprocessor(BasePreprocessor):
                        labels, 
                        preds,
                        save_wrong_preds=True):
-        labels = [item.split('\n[/INST]###Response:')[1].strip() for item in labels]
-        preds = [item.split('\n[/INST]###Response:')[1].strip() for item in preds]
+        labels = [item.split('\n[/INST]\n###Response:')[1].strip() for item in labels]
+        preds = [item.split('\n[/INST]\n###Response:')[1].strip() for item in preds]
 
         labels_ids = []
         preds_ids = []
@@ -186,7 +249,7 @@ class ANLIPreprocessor(BasePreprocessor):
             premise = examples['premise'][i]
             hypothesis = examples['hypothesis'][i]
             response = self.label_mapping[examples['label'][i]]
-            text = f"[INST] <<SYS>> {self.instruction} <</SYS>> ###Premise: {premise}\n###Hypothesis: {hypothesis} \n[/INST]###Response: {response}"
+            text = f"[INST] <<SYS>> {self.instruction} <</SYS>> ###Premise: {premise}\n###Hypothesis: {hypothesis} \n[/INST]\n###Response: {response}"
             output_text.append(text)
         return {'input': output_text}
     
@@ -197,8 +260,8 @@ class ANLIPreprocessor(BasePreprocessor):
             premise = examples['premise'][i]
             hypothesis = examples['hypothesis'][i]
             response = self.label_mapping[examples['label'][i]]
-            text = f"[INST] <<SYS>> {self.instruction} <</SYS>> ###Premise: {premise}\n###Hypothesis: {hypothesis} \n[/INST]###Response:"
-            full_response = f"[INST] <<SYS>> {self.instruction} <</SYS>> ###Premise: {premise}\n###Hypothesis: {hypothesis} \n[/INST]###Response: {response}"
+            text = f"[INST] <<SYS>> {self.instruction} <</SYS>> ###Premise: {premise}\n###Hypothesis: {hypothesis} \n[/INST]\n###Response:"
+            full_response = f"[INST] <<SYS>> {self.instruction} <</SYS>> ###Premise: {premise}\n###Hypothesis: {hypothesis} \n[/INST]\n###Response: {response}"
             output_text.append(text)
             gold_response.append(full_response)
         return {'input': output_text, 'gold': gold_response}
@@ -208,8 +271,8 @@ class ANLIPreprocessor(BasePreprocessor):
                        labels, 
                        preds,
                        save_wrong_preds=True):
-        labels = [item.split('\n[/INST]###Response:')[1].strip() for item in labels]
-        preds = [item.split('\n[/INST]###Response:')[1].strip() for item in preds]
+        labels = [item.split('\n[/INST]\n###Response:')[1].strip() for item in labels]
+        preds = [item.split('\n[/INST]\n###Response:')[1].strip() for item in preds]
 
         labels_ids = []
         preds_ids = []
@@ -285,3 +348,24 @@ class ANLIR2Preprocessor(ANLIPreprocessor):
 
         return train_data, val_data, test_data
     
+
+if __name__=='__main__':
+    from transformers import HfArgumentParser, AutoTokenizer
+    from arguments import ScriptArguments
+
+    parser = HfArgumentParser(ScriptArguments)
+    script_args = parser.parse_args_into_dataclasses()[0]
+    breakpoint()
+
+    preprocessor = get_preprocessor('anli_r1', number_training_examples=50)
+
+    tokenizer = AutoTokenizer.from_pretrained(script_args.model_name, 
+                                              cache_dir='hf_cache')
+    tokenizer.pad_token_id = tokenizer.eos_token_id
+    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "right"  # Fix weird overflow issue with fp16 training
+
+    train_dataloader, val_dataloader, test_dataloader = preprocessor.prepare_data(tokenizer=tokenizer,
+                                                                                  script_args=script_args)
+    breakpoint()
+
