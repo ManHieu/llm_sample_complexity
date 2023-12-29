@@ -12,7 +12,7 @@ class ScriptArguments:
     dataset_name: Optional[str] = field(metadata={"help": "the dataset name"})
     seq_length: Optional[int] = field(default=512, metadata={"help": "Input sequence length"})
     number_training_examples: Optional[int] = field(default=50, metadata={'help': "Number examples of training data"})
-    colate_fn: Optional[str]=field(default='constant_len', metadata='Collate_fn for training data')
+    colate_fn: Optional[str] = field(default="constant_len", metadata={"help": "collate_fn for training"})
 
     # MODEL_PARAMS
     model_name: Optional[str] = field(default="meta-llama/Llama-2-7b-hf", metadata={"help": "the model name"})
@@ -41,9 +41,10 @@ class ScriptArguments:
     )
     
     # MISC.
-    log_with: Optional[str] = field(default="tensorboard", metadata={"help": "use 'wandb' to log with wandb"})
+    # log_with: Optional[str] = field(default="tensorboard", metadata={"help": "use 'wandb' to log with wandb"})
     output_dir: Optional[str] = field(default="output", metadata={"help": "the output directory"})
     logging_steps: Optional[int] = field(default=1, metadata={"help": "the number of logging steps"})
+    gpus: Optional[int] = field(default=1, metadata={"help": "the number of gpus use to run"})
     use_auth_token: Optional[bool] = field(default=True, metadata={"help": "Use HF auth token to access the model"})
     save_steps: Optional[int] = field(
         default=10, metadata={"help": "Number of updates steps before two checkpoint saves"}

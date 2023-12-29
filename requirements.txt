@@ -6,7 +6,9 @@ transformers
 torch 
 torchvision 
 torchaudio
+lightning
 trl
 bitsandbytes
 accelerate
 sentencepiece
+tensorboard

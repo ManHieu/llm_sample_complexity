@@ -1,14 +1,16 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+import os
 from typing import Any, Dict, List, Optional, Tuple
 from datasets import load_dataset, Dataset
 import torch
 from torch.utils.data import DataLoader
+import torchmetrics
 import tqdm
 from trl.trainer import ConstantLengthDataset, DataCollatorForCompletionOnlyLM 
 from transformers import PreTrainedTokenizerBase
 
-from .base_dataset import BaseDataset
+from data_module.base_dataset import BaseDataset
 
 PREPROCESSOR = {}
 
@@ -34,7 +36,6 @@ class LLMComplexityDataCollator:
 
 
 class BasePreprocessor(ABC):
-
     def __init__(self, 
                  number_training_examples: int,) -> None:
         super().__init__()
@@ -45,21 +46,24 @@ class BasePreprocessor(ABC):
         raise NotImplementedError
     
     @abstractmethod
-    def load_dataset(self) -> Tuple[Dataset, Dataset, Dataset]:
+    def process_data(self) -> Tuple[Dataset, Dataset, Dataset]:
         raise NotImplementedError
     
     @abstractmethod
-    def compute_metric(self, 
-                       number_training_example, 
+    def process_outputs(self,  
                        labels, 
                        preds,
                        save_wrong_preds=True):
         raise NotImplementedError
     
+    @abstractmethod
+    def metric(self):
+        raise NotImplementedError
+    
     def prepare_data(self, 
                         tokenizer, 
                         script_args):
-        train_data, val_data, test_data = self.load_dataset()
+        train_data, val_data, test_data = self.process_data()
 
         if script_args.colate_fn == 'constant_len':
             chars_per_token = self.chars_token_ratio(train_data, tokenizer)
@@ -71,25 +75,31 @@ class BasePreprocessor(ABC):
                                                 infinite=True,
                                                 chars_per_token=chars_per_token,
                                                 eos_token_id=tokenizer.eos_token_id,)
+            train_dataloader = DataLoader(train_dataset, 
+                                          batch_size=script_args.batch_size,
+                                          pin_memory=False,
+                                          drop_last=True)
         elif script_args.colate_fn == 'completion':
             # instruct_template = "[INST] <<SYS>>"
-            response_template = "\n###Response:"
-            collator = DataCollatorForCompletionOnlyLM(response_template=response_template, 
+            response_template_ids = tokenizer.encode('###Response:', add_special_tokens=False)
+            collator = DataCollatorForCompletionOnlyLM(response_template=response_template_ids, 
                                                     tokenizer=tokenizer, 
                                                     mlm=False)
+            train_data = train_data.map(lambda example: self.tokenize_func(examples=example, tokenizer=tokenizer, max_seq_len=script_args.seq_length),
+                                batched=True, remove_columns=train_data.column_names, load_from_cache_file=False)
             train_dataset = BaseDataset(train_data)
             train_dataloader = DataLoader(train_dataset, 
                                           batch_size=script_args.batch_size,
                                           collate_fn=collator,
-                                          num_workers=8,
+                                          num_workers=20,
                                           shuffle=True,
                                           pin_memory=False,
                                           drop_last=True)
             
-        val_collator = LLMComplexityDataCollator(self.tokenizer, 
-                                                 self.max_seq_length)
+        val_collator = LLMComplexityDataCollator(tokenizer, 
+                                                 script_args.seq_length)
         val_data = val_data.map(lambda example: self.tokenize_func_for_evaluation(examples=example, tokenizer=tokenizer, max_seq_len=script_args.seq_length),
-                                batched=True, remove_columns=val_data.column_names)
+                                batched=True, remove_columns=val_data.column_names, load_from_cache_file=False)
         val_data.set_format(type="torch", columns=val_data.column_names)
         val_dataset = BaseDataset(val_data)
         val_dataloader = DataLoader(val_dataset,
@@ -100,8 +110,8 @@ class BasePreprocessor(ABC):
                                     pin_memory=False,
                                     drop_last=True)
 
-        test_data = test_data.map(lambda example: self.tokenize_func_for_evaluation(examples=example, tokenizer=tokenizer, max_seq_len=script_args.seq_length),
-                                batched=True, remove_columns=test_data.column_names)
+        test_data = test_data.map(lambda example: self.tokenize_func_for_evaluation(examples=example, tokenizer=tokenizer, max_seq_len=script_args.seq_length,),
+                                batched=True, remove_columns=test_data.column_names, load_from_cache_file=False)
         test_data.set_format(type="torch", columns=test_data.column_names)
         test_dataset = BaseDataset(test_data)
         test_dataloader = DataLoader(test_dataset,
@@ -129,6 +139,16 @@ class BasePreprocessor(ABC):
         return {'input_ids': tokenized_input['input_ids'],
                 'attention_mask': tokenized_input['attention_mask'],
                 'labels': tokenized_output['input_ids'],}
+    
+    @staticmethod
+    def tokenize_func(examples, tokenizer, max_seq_len):
+        tokenized_input = tokenizer(examples['input'],
+                                    padding='longest',
+                                    max_length=max_seq_len,
+                                    return_overflowing_tokens=False,
+                                    return_length=False,)
+        return {'input_ids': tokenized_input['input_ids'],
+                'attention_mask': tokenized_input['attention_mask'],}
     
     @staticmethod
     def chars_token_ratio(dataset, tokenizer, nb_examples=400):
@@ -173,7 +193,7 @@ class SSTPreprocessor(BasePreprocessor):
         for i in range(len(examples['text'])):
             input_text = examples['text'][i]
             response = self.label_mapping[examples['label'][i]]
-            text = f"[INST] <<SYS>> {self.instruction} <</SYS>> ###Text: {input_text} \n[/INST]\n###Response: {response}"
+            text = f"[INST] <<SYS>> {self.instruction} <</SYS>> ###Text: {input_text} [/INST] ###Response: {response}"
             output_text.append(text)
         return {'input': output_text}
     
@@ -184,14 +204,14 @@ class SSTPreprocessor(BasePreprocessor):
         for i in range(len(examples['text'])):
             input_text = examples['text'][i]
             response = self.label_mapping[examples['label'][i]]
-            text = f"[INST] <<SYS>> {self.instruction} <</SYS>> ###Text: {input_text} \n[/INST]\n###Response:"
-            full_response = f"[INST] <<SYS>> {self.instruction} <</SYS>> ###Text: {input_text} \n[/INST]\n###Response: {response}"
+            text = f"[INST] <<SYS>> {self.instruction} <</SYS>> ###Text: {input_text} [/INST] ###Response:"
+            full_response = f"[INST] <<SYS>> {self.instruction} <</SYS>> ###Text: {input_text} [/INST] ###Response: {response}"
             output_text.append(text)
             gold_response.append(full_response)
             label.append(response)
         return {'input': output_text, 'gold': gold_response, 'label': label}
     
-    def load_dataset(self):
+    def process_data(self):
         data = load_dataset('SetFit/sst2', cache_dir='./hf_cache')
         train_data = data['train']
         train_data = train_data.train_test_split(train_size=self.number_training_examples, seed=1741)['train']
@@ -204,13 +224,13 @@ class SSTPreprocessor(BasePreprocessor):
 
         return train_data, val_data, test_data
     
-    def compute_metric(self, 
+    def process_outputs(self, 
                        number_training_example, 
                        labels, 
                        preds,
                        save_wrong_preds=True):
-        labels = [item.split('\n[/INST]\n###Response:')[1].strip() for item in labels]
-        preds = [item.split('\n[/INST]\n###Response:')[1].strip() for item in preds]
+        labels = [item.split('###Response:')[1].strip() for item in labels]
+        preds = [item.split('###Response:')[1].strip() for item in preds]
 
         labels_ids = []
         preds_ids = []
@@ -249,7 +269,7 @@ class ANLIPreprocessor(BasePreprocessor):
             premise = examples['premise'][i]
             hypothesis = examples['hypothesis'][i]
             response = self.label_mapping[examples['label'][i]]
-            text = f"[INST] <<SYS>> {self.instruction} <</SYS>> ###Premise: {premise}\n###Hypothesis: {hypothesis} \n[/INST]\n###Response: {response}"
+            text = f"[INST] <<SYS>> {self.instruction} <</SYS>> ###Premise: {premise}\n###Hypothesis: {hypothesis} [/INST] ###Response: {response}"
             output_text.append(text)
         return {'input': output_text}
     
@@ -260,19 +280,18 @@ class ANLIPreprocessor(BasePreprocessor):
             premise = examples['premise'][i]
             hypothesis = examples['hypothesis'][i]
             response = self.label_mapping[examples['label'][i]]
-            text = f"[INST] <<SYS>> {self.instruction} <</SYS>> ###Premise: {premise}\n###Hypothesis: {hypothesis} \n[/INST]\n###Response:"
-            full_response = f"[INST] <<SYS>> {self.instruction} <</SYS>> ###Premise: {premise}\n###Hypothesis: {hypothesis} \n[/INST]\n###Response: {response}"
+            text = f"[INST] <<SYS>> {self.instruction} <</SYS>> ###Premise: {premise}\n###Hypothesis: {hypothesis} [/INST] ###Response:"
+            full_response = f"[INST] <<SYS>> {self.instruction} <</SYS>> ###Premise: {premise}\n###Hypothesis: {hypothesis} [/INST] ###Response: {response}"
             output_text.append(text)
             gold_response.append(full_response)
         return {'input': output_text, 'gold': gold_response}
     
-    def compute_metric(self, 
-                       number_training_example, 
+    def process_outputs(self, 
                        labels, 
                        preds,
                        save_wrong_preds=True):
-        labels = [item.split('\n[/INST]\n###Response:')[1].strip() for item in labels]
-        preds = [item.split('\n[/INST]\n###Response:')[1].strip() for item in preds]
+        labels = [item.split('###Response:')[-1].strip() for item in labels]
+        preds = [item.split('###Response:')[-1].strip() for item in preds]
 
         labels_ids = []
         preds_ids = []
@@ -288,19 +307,22 @@ class ANLIPreprocessor(BasePreprocessor):
                 wrong_results['pred'].append(pred)
         if save_wrong_preds:
             dataset = Dataset.from_dict(wrong_results)
-            dataset.to_json(f'Wrong_result_{self.name}_{number_training_example}.jsonl')
+            dataset.to_json(f'Wrong_result_{self.name}_{self.number_training_examples}.jsonl')
 
         labels = torch.tensor(labels_ids)
         preds = torch.tensor(preds_ids)
-        return {'acc': torch.sum(labels==preds).float() / labels.numel()}
+        return labels, preds
+
+    def metric(self):
+        return torchmetrics.Accuracy(task="multiclass", num_classes=4)
 
 
 @register_preprocess
 class ANLIR1Preprocessor(ANLIPreprocessor):
     name = 'anli_r1'
 
-    def load_dataset(self):
-        data = load_dataset('anli', cache_dir='./hf_cache')
+    def process_data(self):
+        data = load_dataset('anli', cache_dir=os.path.abspath('hf_cache'))
         train_data = data['train_r1']
         train_data = train_data.train_test_split(train_size=self.number_training_examples, seed=1741)['train']
         val_data = data['dev_r1'].train_test_split(train_size=100, seed=1741)['train']
@@ -317,8 +339,8 @@ class ANLIR1Preprocessor(ANLIPreprocessor):
 class ANLIR2Preprocessor(ANLIPreprocessor):
     name = 'anli_r2'
 
-    def load_dataset(self):
-        data = load_dataset('anli', cache_dir='./hf_cache')
+    def process_data(self):
+        data = load_dataset('anli', cache_dir=os.path.abspath('hf_cache'))
         train_data = data['train_r2']
         train_data = train_data.train_test_split(train_size=self.number_training_examples, seed=1741)['train']
         val_data = data['dev_r2'].train_test_split(train_size=100, seed=1741)['train']
@@ -335,8 +357,8 @@ class ANLIR2Preprocessor(ANLIPreprocessor):
 class ANLIR2Preprocessor(ANLIPreprocessor):
     name = 'anli_r3'
 
-    def load_dataset(self):
-        data = load_dataset('anli', cache_dir='./hf_cache')
+    def process_data(self):
+        data = load_dataset('anli', cache_dir=os.path.abspath('hf_cache'))
         train_data = data['train_r3']
         train_data = train_data.train_test_split(train_size=self.number_training_examples, seed=1741)['train']
         val_data = data['dev_r3'].train_test_split(train_size=100, seed=1741)['train']
@@ -348,24 +370,4 @@ class ANLIR2Preprocessor(ANLIPreprocessor):
 
         return train_data, val_data, test_data
     
-
-if __name__=='__main__':
-    from transformers import HfArgumentParser, AutoTokenizer
-    from arguments import ScriptArguments
-
-    parser = HfArgumentParser(ScriptArguments)
-    script_args = parser.parse_args_into_dataclasses()[0]
-    breakpoint()
-
-    preprocessor = get_preprocessor('anli_r1', number_training_examples=50)
-
-    tokenizer = AutoTokenizer.from_pretrained(script_args.model_name, 
-                                              cache_dir='hf_cache')
-    tokenizer.pad_token_id = tokenizer.eos_token_id
-    tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "right"  # Fix weird overflow issue with fp16 training
-
-    train_dataloader, val_dataloader, test_dataloader = preprocessor.prepare_data(tokenizer=tokenizer,
-                                                                                  script_args=script_args)
-    breakpoint()
 
