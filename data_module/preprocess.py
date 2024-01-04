@@ -224,6 +224,9 @@ class SSTPreprocessor(BasePreprocessor):
 
         return train_data, val_data, test_data
     
+    def metric(self):
+        return torchmetrics.Accuracy(task="multiclass", num_classes=3)
+    
     def process_outputs(self, 
                        number_training_example, 
                        labels, 
@@ -250,7 +253,7 @@ class SSTPreprocessor(BasePreprocessor):
 
         labels = torch.tensor(labels_ids)
         preds = torch.tensor(preds_ids)
-        return {'acc': torch.sum(labels==preds).float() / labels.numel()}
+        return labels, preds
     
 
 class ANLIPreprocessor(BasePreprocessor):
@@ -371,3 +374,89 @@ class ANLIR2Preprocessor(ANLIPreprocessor):
         return train_data, val_data, test_data
     
 
+@register_preprocess
+class CommonsenseQAPreprocessor(BasePreprocessor):
+    name = 'commonsense_qa'
+    label_mapping = {0: 'Correct answer is A', 
+                     1: 'Correct answer is B', 
+                     2: 'Correct answer is C',
+                     3: 'Correct answer is D',
+                     4: 'Correct answer is E'}
+    label_to_id = {'Correct answer is A': 0, 
+                   'Correct answer is B': 1, 
+                   'Correct answer is C': 2,
+                   'Correct answer is D': 3,
+                   'Correct answer is E': 4}
+    instruction = "CommonsenseQA is a question answering dataset that tests commonsense reasoning. Each example consists of a question, a correct answer, and several incorrect answers. Your goal is to select the correct answer to each question by applying common sense knowledge and reasoning. For each question, think carefully about the context and choose the most logical, plausible answer. Do not just pattern match or rely on superficial word associations. Reason about the deeper meaning of the question and use general common sense, not specialized knowledge, to select the right answer."
+    posible_outputs = ['###Response: Correct answer is A', '###Response: Correct answer is B', '###Response: Correct answer is C', '###Response: Correct answer is D', '###Response: Correct answer is D']
+    
+    def formating_prompts_func(self, examples):
+        output_text = []
+        for i in range(len(examples['question'])):
+            question = examples['question'][i]
+            choices = examples['choices'][i]
+            choices = [f"{choices['label'][i]}: {choices['text'][i]}" for i in range(len(choices['label']))]
+            choices = '\n'.join(choices)
+            response = f"Correct answer is {examples['answerKey'][i]}"
+            text = f"[INST] <<SYS>> {self.instruction} <</SYS>> ###Question: {question}\n###Answers:\n{choices} [/INST] ###Response: {response}"
+            output_text.append(text)
+        return {'input': output_text}
+    
+
+    def formating_prompts_func_for_evluation(self, examples):
+        output_text = []
+        gold_response = []
+        for i in range(len(examples['question'])):
+            question = examples['question'][i]
+            choices = examples['choices'][i]
+            choices = [f"{choices['label'][i]}: {choices['text'][i]}" for i in range(len(choices['label']))]
+            choices = '\n'.join(choices)
+            response = f"Correct answer is {examples['answerKey'][i]}"
+            text = f"[INST] <<SYS>> {self.instruction} <</SYS>> ###Question: {question}\n###Answers:\n{choices} [/INST] ###Response:"
+            full_response = f"[INST] <<SYS>> {self.instruction} <</SYS>> ###Question: {question}\n###Answers:\n{choices} [/INST] ###Response: {response}"
+            output_text.append(text)
+            gold_response.append(full_response)
+        return {'input': output_text, 'gold': gold_response}
+    
+    def process_outputs(self, 
+                       labels, 
+                       preds,
+                       save_wrong_preds=True):
+        labels = [item.split('###Response:')[-1].strip() for item in labels]
+        preds = [item.split('###Response:')[-1].strip() for item in preds]
+
+        labels_ids = []
+        preds_ids = []
+        wrong_results = {'label': [],
+                         'pred': []}
+        for label, pred in zip(labels, preds):
+            labels_ids.append(self.label_to_id[label])
+            _pred = pred[0:len(label)]
+            pred_idx = self.label_to_id.get(_pred, -1)
+            preds_ids.append(pred_idx)
+            if _pred != label:
+                wrong_results['label'].append(label)
+                wrong_results['pred'].append(pred)
+        if save_wrong_preds:
+            dataset = Dataset.from_dict(wrong_results)
+            dataset.to_json(f'Wrong_result_{self.name}_{self.number_training_examples}.jsonl')
+
+        labels = torch.tensor(labels_ids)
+        preds = torch.tensor(preds_ids)
+        return labels, preds
+
+    def metric(self):
+        return torchmetrics.Accuracy(task="multiclass", num_classes=5)
+
+    def process_data(self):
+        data = load_dataset('commonsense_qa', cache_dir=os.path.abspath('hf_cache'))
+        train_data = data['train']
+        train_data = train_data.train_test_split(train_size=self.number_training_examples, seed=1741)['train']
+        val_data = data['validation'].train_test_split(train_size=100, seed=1741)['train']
+        test_data = data['validation']
+
+        train_data = train_data.map(self.formating_prompts_func, batched=True, load_from_cache_file=False)
+        val_data = val_data.map(self.formating_prompts_func_for_evluation, batched=True, load_from_cache_file=False)
+        test_data = test_data.map(self.formating_prompts_func_for_evluation, batched=True, load_from_cache_file=False)
+
+        return train_data, val_data, test_data
