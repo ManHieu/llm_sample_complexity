@@ -460,3 +460,81 @@ class CommonsenseQAPreprocessor(BasePreprocessor):
         test_data = test_data.map(self.formating_prompts_func_for_evluation, batched=True, load_from_cache_file=False)
 
         return train_data, val_data, test_data
+
+
+@register_preprocess
+class BoolQAPreprocessor(BasePreprocessor):
+    name = 'bool_qa'
+    label_mapping = {0: 'It is false', 
+                     1: 'It is true',}
+    label_to_id = {'It is false': 0, 
+                   'It is true': 1,}
+    instruction = "I want you to answer True/False questions based on the passage provided. The passage will contain all the information needed to determine if the question is true or false. Please read the passage carefully and answer the following True/False questions."
+    posible_outputs = ['###Response: It is false', '###Response: It is true']
+    
+    def formating_prompts_func(self, examples):
+        output_text = []
+        for i in range(len(examples['question'])):
+            question = examples['question'][i]
+            response = 'It is false' if examples['answer'][i]==False else 'It is true'
+            passage = examples['passage'][i]
+            text = f"[INST] <<SYS>> {self.instruction} <</SYS>>###Passage:\n{passage}\n###Question: {question} [/INST] ###Response: {response}"
+            output_text.append(text)
+        return {'input': output_text}
+    
+
+    def formating_prompts_func_for_evluation(self, examples):
+        output_text = []
+        gold_response = []
+        for i in range(len(examples['question'])):
+            question = examples['question'][i]
+            response = 'It is false' if examples['answer'][i]==False else 'It is true'
+            passage = examples['passage'][i]
+            full_response = f"[INST] <<SYS>> {self.instruction} <</SYS>>###Passage:\n{passage}\n###Question: {question} [/INST] ###Response: {response}"
+            text = f"[INST] <<SYS>> {self.instruction} <</SYS>>###Passage:\n{passage}\n###Question: {question} [/INST] ###Response:"
+            output_text.append(text)
+            gold_response.append(full_response)
+        return {'input': output_text, 'gold': gold_response}
+    
+    def process_outputs(self, 
+                       labels, 
+                       preds,
+                       save_wrong_preds=True):
+        labels = [item.split('###Response:')[-1].strip() for item in labels]
+        preds = [item.split('###Response:')[-1].strip() for item in preds]
+
+        labels_ids = []
+        preds_ids = []
+        wrong_results = {'label': [],
+                         'pred': []}
+        for label, pred in zip(labels, preds):
+            labels_ids.append(self.label_to_id[label])
+            _pred = pred[0:len(label)]
+            pred_idx = self.label_to_id.get(_pred, -1)
+            preds_ids.append(pred_idx)
+            if _pred != label:
+                wrong_results['label'].append(label)
+                wrong_results['pred'].append(pred)
+        if save_wrong_preds:
+            dataset = Dataset.from_dict(wrong_results)
+            dataset.to_json(f'Wrong_result_{self.name}_{self.number_training_examples}.jsonl')
+
+        labels = torch.tensor(labels_ids)
+        preds = torch.tensor(preds_ids)
+        return labels, preds
+
+    def metric(self):
+        return torchmetrics.Accuracy(task="multiclass", num_classes=5)
+
+    def process_data(self):
+        data = load_dataset('boolq', cache_dir=os.path.abspath('hf_cache'))
+        train_data = data['train']
+        train_data = train_data.train_test_split(train_size=self.number_training_examples, seed=1741)['train']
+        val_data = data['validation'].train_test_split(train_size=100, seed=1741)['train']
+        test_data = data['validation']
+
+        train_data = train_data.map(self.formating_prompts_func, batched=True, load_from_cache_file=False)
+        val_data = val_data.map(self.formating_prompts_func_for_evluation, batched=True, load_from_cache_file=False)
+        test_data = test_data.map(self.formating_prompts_func_for_evluation, batched=True, load_from_cache_file=False)
+
+        return train_data, val_data, test_data
