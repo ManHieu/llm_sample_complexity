@@ -388,7 +388,7 @@ class CommonsenseQAPreprocessor(BasePreprocessor):
                    'Correct answer is D': 3,
                    'Correct answer is E': 4}
     instruction = "CommonsenseQA is a question answering dataset that tests commonsense reasoning. Each example consists of a question, a correct answer, and several incorrect answers. Your goal is to select the correct answer to each question by applying common sense knowledge and reasoning. For each question, think carefully about the context and choose the most logical, plausible answer. Do not just pattern match or rely on superficial word associations. Reason about the deeper meaning of the question and use general common sense, not specialized knowledge, to select the right answer."
-    posible_outputs = ['###Response: Correct answer is A', '###Response: Correct answer is B', '###Response: Correct answer is C', '###Response: Correct answer is D', '###Response: Correct answer is D']
+    posible_outputs = ['###Response: Correct answer is A', '###Response: Correct answer is B', '###Response: Correct answer is C', '###Response: Correct answer is D', '###Response: Correct answer is E']
     
     def formating_prompts_func(self, examples):
         output_text = []
@@ -446,7 +446,7 @@ class CommonsenseQAPreprocessor(BasePreprocessor):
         return labels, preds
 
     def metric(self):
-        return torchmetrics.Accuracy(task="multiclass", num_classes=5)
+        return torchmetrics.Accuracy(task="multiclass", num_classes=6)
 
     def process_data(self):
         data = load_dataset('commonsense_qa', cache_dir=os.path.abspath('hf_cache'))
@@ -524,7 +524,7 @@ class BoolQAPreprocessor(BasePreprocessor):
         return labels, preds
 
     def metric(self):
-        return torchmetrics.Accuracy(task="multiclass", num_classes=5)
+        return torchmetrics.Accuracy(task="multiclass", num_classes=3)
 
     def process_data(self):
         data = load_dataset('boolq', cache_dir=os.path.abspath('hf_cache'))
