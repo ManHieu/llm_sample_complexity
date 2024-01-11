@@ -97,6 +97,9 @@ if __name__=='__main__':
                                                         torch_dtype=torch.float16,
                                                         offload_folder="offload",
                                                         cache_dir='hf_cache')
+        del best_model
+        gc.collect()
+
         model = model.merge_and_unload()
         preprocessor = get_preprocessor(params.dataset_name, 
                                     number_training_examples=params.number_training_examples)
@@ -108,7 +111,7 @@ if __name__=='__main__':
         tokenizer.padding_side = "right"  # Fix weird overflow issue with fp16 training
 
         _, _, test_data = preprocessor.process_data()
-        test_dataloader = DataLoader(test_data, batch_size=params.batch_size)
+        test_dataloader = DataLoader(test_data, batch_size=1)
         if hasattr(preprocessor, 'posible_outputs'):
             posible_outputs = preprocessor.posible_outputs
             posible_outputs_ids = tokenizer(posible_outputs, add_special_tokens=False).input_ids
@@ -125,18 +128,20 @@ if __name__=='__main__':
             gold = batch['gold']
 
             with torch.no_grad():
-                gold_size = tokenizer(gold, return_tensors="pt", padding='longest').input_ids.size(-1)
-                inputs = tokenizer(prompt, return_tensors="pt", padding='longest')
-                generate_ids = model.generate(inputs.input_ids.cuda(), 
-                                            attention_mask=inputs.attention_mask.cuda(), 
-                                            max_length=gold_size+5,
-                                            num_beams=5,
-                                            do_sample=False,
-                                            num_return_sequences=1,
-                                            constraints=constraints,
-                                            no_repeat_ngram_size=2)
-            
-            responses = tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+                try:
+                    gold_size = tokenizer(gold, return_tensors="pt", padding='longest').input_ids.size(-1)
+                    inputs = tokenizer(prompt, return_tensors="pt", padding='longest')
+                    generate_ids = model.generate(inputs.input_ids.cuda(), 
+                                                attention_mask=inputs.attention_mask.cuda(), 
+                                                max_length=gold_size+5,
+                                                num_beams=5,
+                                                do_sample=False,
+                                                num_return_sequences=1,
+                                                constraints=constraints,
+                                                no_repeat_ngram_size=2)
+                    responses = tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+                except:
+                    responses = ['']*len(gold)
             preds.extend(responses)
             labels.extend(gold)
         
