@@ -95,6 +95,7 @@ if __name__=='__main__':
         model = AutoPeftModelForCausalLM.from_pretrained(experiment_dir, 
                                                         device_map="auto", 
                                                         torch_dtype=torch.float16,
+                                                        offload_folder="offload",
                                                         cache_dir='hf_cache')
         model = model.merge_and_unload()
         preprocessor = get_preprocessor(params.dataset_name, 
@@ -123,16 +124,17 @@ if __name__=='__main__':
             prompt = batch['input']
             gold = batch['gold']
 
-            gold_size = tokenizer(gold, return_tensors="pt", padding='longest').input_ids.size(-1)
-            inputs = tokenizer(prompt, return_tensors="pt", padding='longest')
-            generate_ids = model.generate(inputs.input_ids.cuda(), 
-                                        attention_mask=inputs.attention_mask.cuda(), 
-                                        max_length=gold_size+5,
-                                        num_beams=10,
-                                        do_sample=False,
-                                        num_return_sequences=1,
-                                        constraints=constraints,
-                                        no_repeat_ngram_size=2)
+            with torch.no_grad():
+                gold_size = tokenizer(gold, return_tensors="pt", padding='longest').input_ids.size(-1)
+                inputs = tokenizer(prompt, return_tensors="pt", padding='longest')
+                generate_ids = model.generate(inputs.input_ids.cuda(), 
+                                            attention_mask=inputs.attention_mask.cuda(), 
+                                            max_length=gold_size+5,
+                                            num_beams=5,
+                                            do_sample=False,
+                                            num_return_sequences=1,
+                                            constraints=constraints,
+                                            no_repeat_ngram_size=2)
             
             responses = tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
             preds.extend(responses)
@@ -151,7 +153,6 @@ if __name__=='__main__':
             f.write(f'_'*10 + '\n')
 
         del model
-        del best_model
         del metric
         shutil.rmtree(experiment_dir)
         shutil.rmtree(os.path.join(params.output_dir, f'{params.dataset_name}_{params.number_training_examples}', 'checkpoints'))

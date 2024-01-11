@@ -481,7 +481,6 @@ class BoolQAPreprocessor(BasePreprocessor):
             text = f"[INST] <<SYS>> {self.instruction} <</SYS>>###Passage:\n{passage}\n###Question: {question} [/INST] ###Response: {response}"
             output_text.append(text)
         return {'input': output_text}
-    
 
     def formating_prompts_func_for_evluation(self, examples):
         output_text = []
